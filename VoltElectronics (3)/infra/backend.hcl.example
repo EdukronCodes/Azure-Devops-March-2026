@@ -1,0 +1,5 @@
+resource_group_name  = "volt-electronics-tfstate-rg"
+storage_account_name = "REPLACE_WITH_UNIQUE_STORAGE_NAME"
+container_name       = "tfstate"
+key                  = "volt-electronics/app.tfstate"
+use_azuread_auth     = true

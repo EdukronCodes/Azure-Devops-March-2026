@@ -1,0 +1,476 @@
+# Azure Repos PR validation is configured through the main branch policy.
+# Deployment variables: azureServiceConnection, subscriptionId, appName, azureLocation,
+# stateResourceGroup, stateStorageAccount, sshPublicKey (public key only).
+name: volt-electronics-$(Date:yyyyMMdd).$(Rev:r)
+parameters:
+- name: deployAzure
+  displayName: Apply Terraform and deploy to Azure (configured federation required)
+  type: boolean
+  default: false
+- name: sonarMode
+  displayName: SonarQube server mode
+  type: string
+  default: ephemeral
+  values:
+  - ephemeral
+  - external
+trigger:
+  batch: true
+  branches:
+    include:
+    - main
+    - feature/*
+pool:
+  vmImage: ubuntu-24.04
+variables:
+  pythonVersion: '3.12'
+  terraformVersion: 1.9.8
+  trivyVersion: 0.75.0
+stages:
+- stage: Overview
+  displayName: 01 · Release context and downloadable source
+  dependsOn: []
+  jobs:
+  - job: Overview
+    steps:
+    - bash: |-
+        set -euo pipefail
+        python scripts/pipeline_summary.py Overview
+      displayName: Print stage purpose and release identity
+      env:
+        DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: $(pythonVersion)
+    - bash: |-
+        set -euo pipefail
+        python scripts/source_bundle.py "$(Build.ArtifactStagingDirectory)/source/volt-electronics-source.zip"
+        printf "Build: %s\nCommit: %s\nSource: %s\n" "$(Build.BuildId)" "$(Build.SourceVersion)" "$(Build.Repository.Uri)"
+      displayName: Export full project without secrets, SQLite data or Terraform state
+    - publish: $(Build.ArtifactStagingDirectory)/source
+      artifact: source-code
+- stage: Validate
+  displayName: 02 · Validate application and Terraform
+  dependsOn:
+  - Overview
+  jobs:
+  - job: Validate
+    steps:
+    - bash: |-
+        set -euo pipefail
+        python scripts/pipeline_summary.py Validate
+      displayName: Print stage purpose and release identity
+      env:
+        DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: $(pythonVersion)
+    - template: pipelines/templates/install-terraform.yml
+    - bash: |-
+        set -euo pipefail
+        python -m compileall -q app.py catalog.py scripts tests
+        node --check static/app.js
+        terraform fmt -check -recursive infra
+        terraform -chdir=infra init -backend=false -lockfile=readonly -input=false
+        terraform -chdir=infra validate
+        terraform -chdir=infra test
+        terraform -chdir=infra/bootstrap init -backend=false -lockfile=readonly -input=false
+        terraform -chdir=infra/bootstrap validate
+        terraform -chdir=infra/ci-backend init -backend=false -lockfile=readonly -input=false
+        terraform -chdir=infra/ci-backend validate
+      displayName: Check syntax, provider schemas and architecture assertions
+- stage: UnitTests
+  displayName: 03 · Unit tests and coverage
+  dependsOn:
+  - Validate
+  jobs:
+  - job: UnitTests
+    steps:
+    - bash: |-
+        set -euo pipefail
+        python scripts/pipeline_summary.py UnitTests
+      displayName: Print stage purpose and release identity
+      env:
+        DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: $(pythonVersion)
+    - bash: |-
+        set -euo pipefail
+        python -m pip install -r requirements-dev.txt
+        mkdir -p reports
+        python -m pytest tests -v --junitxml=reports/tests.xml --cov=app --cov=catalog --cov-report=xml:reports/coverage.xml --cov-report=html:reports/coverage-html --cov-report=term-missing --cov-fail-under=90
+      displayName: Test login, checkout, inventory, wishlist, comparison and administration
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: reports/tests.xml
+        failTaskOnFailedTests: true
+        failTaskOnMissingResultsFile: true
+        testRunTitle: VOLT ecommerce behavior
+    - task: PublishCodeCoverageResults@2
+      condition: succeededOrFailed()
+      inputs:
+        summaryFileLocation: $(System.DefaultWorkingDirectory)/reports/coverage.xml
+        pathToSources: $(System.DefaultWorkingDirectory)
+        failIfCoverageEmpty: true
+    - publish: reports
+      artifact: unit-test-reports
+      condition: succeededOrFailed()
+- stage: SonarQube
+  displayName: 04 · SonarQube analysis and quality gate
+  dependsOn:
+  - UnitTests
+  jobs:
+  - job: SonarQube
+    steps:
+    - bash: |-
+        set -euo pipefail
+        python scripts/pipeline_summary.py SonarQube
+      displayName: Print stage purpose and release identity
+      env:
+        DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: $(pythonVersion)
+    - download: current
+      artifact: unit-test-reports
+    - bash: |-
+        set -euo pipefail
+        mkdir -p reports
+        cp "$(Pipeline.Workspace)/unit-test-reports/coverage.xml" reports/coverage.xml
+      displayName: Restore measured Python coverage
+    - ${{ if eq(parameters.sonarMode, 'ephemeral') }}:
+      - bash: |-
+          set -euo pipefail
+          python scripts/sonar_scan.py --mode ephemeral
+        displayName: Run isolated SonarQube server, scan and enforce quality gate
+    - ${{ if eq(parameters.sonarMode, 'external') }}:
+      - bash: |-
+          set -euo pipefail
+          python scripts/sonar_scan.py --mode external
+        displayName: Analyze against configured SonarQube server
+        env:
+          SONAR_HOST_URL: $(sonarHostUrl)
+          SONAR_TOKEN: $(sonarToken)
+    - publish: reports/sonarqube
+      artifact: sonarqube-reports
+      condition: succeededOrFailed()
+- stage: TrivySource
+  displayName: 05 · Trivy source, secrets and Terraform scan
+  dependsOn:
+  - Validate
+  jobs:
+  - job: TrivySource
+    steps:
+    - bash: |-
+        set -euo pipefail
+        python scripts/pipeline_summary.py TrivySource
+      displayName: Print stage purpose and release identity
+      env:
+        DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+    - bash: |-
+        set -euo pipefail
+        bash scripts/trivy-scan.sh source
+      displayName: Fail on HIGH or CRITICAL source findings
+      env:
+        TRIVY_VERSION: $(trivyVersion)
+    - publish: reports/trivy
+      artifact: trivy-source-reports
+      condition: succeededOrFailed()
+- stage: BuildPackage
+  displayName: 06 · Build application ZIP
+  dependsOn:
+  - SonarQube
+  - TrivySource
+  jobs:
+  - job: BuildPackage
+    steps:
+    - bash: |-
+        set -euo pipefail
+        python scripts/pipeline_summary.py BuildPackage
+      displayName: Print stage purpose and release identity
+      env:
+        DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: $(pythonVersion)
+    - bash: |-
+        set -euo pipefail
+        python scripts/package.py "$(Build.ArtifactStagingDirectory)/application" --commit "$(Build.SourceVersion)" --build "$(Build.BuildId)"
+      displayName: Package exact commit, metadata and checksum
+    - publish: $(Build.ArtifactStagingDirectory)/application
+      artifact: application
+- stage: BuildContainer
+  displayName: 07 · Build immutable container
+  dependsOn:
+  - BuildPackage
+  jobs:
+  - job: BuildContainer
+    steps:
+    - bash: |-
+        set -euo pipefail
+        python scripts/pipeline_summary.py BuildContainer
+      displayName: Print stage purpose and release identity
+      env:
+        DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+    - download: current
+      artifact: application
+    - bash: |-
+        set -euo pipefail
+        cd "$(Pipeline.Workspace)/application"
+        sha256sum -c app.zip.sha256
+        mkdir -p "$(Agent.TempDirectory)/container-context"
+        unzip -q app.zip -d "$(Agent.TempDirectory)/container-context"
+        cp "$(Build.SourcesDirectory)/Dockerfile" "$(Agent.TempDirectory)/container-context/Dockerfile"
+        docker build --pull --label org.opencontainers.image.revision="$(Build.SourceVersion)" -t "volt:$(Build.BuildId)" "$(Agent.TempDirectory)/container-context"
+        docker run --rm --read-only --tmpfs /tmp --tmpfs /data:uid=10001,gid=10001 --entrypoint python "volt:$(Build.BuildId)" -c "import app; c=app.app.test_client(); assert c.get('/health').json['status']=='healthy'; assert len(c.get('/api/products').json)==12; print('PASS: nonroot container SQLite and catalog')"
+        mkdir -p "$(Build.ArtifactStagingDirectory)/container-image"
+        cd "$(Build.ArtifactStagingDirectory)/container-image"
+        docker save "volt:$(Build.BuildId)" -o image.tar
+        sha256sum image.tar > image.tar.sha256
+        docker image inspect "volt:$(Build.BuildId)" > image-metadata.json
+      displayName: Build nonroot image and record SHA256
+    - publish: $(Build.ArtifactStagingDirectory)/container-image
+      artifact: container-image
+- stage: TrivyImage
+  displayName: 08 · Trivy container gate and SBOM
+  dependsOn:
+  - BuildContainer
+  jobs:
+  - job: TrivyImage
+    steps:
+    - bash: |-
+        set -euo pipefail
+        python scripts/pipeline_summary.py TrivyImage
+      displayName: Print stage purpose and release identity
+      env:
+        DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+    - download: current
+      artifact: container-image
+    - bash: |-
+        set -euo pipefail
+        bash scripts/trivy-scan.sh image
+      displayName: Scan deployable image and export CycloneDX SBOM
+      env:
+        TRIVY_VERSION: $(trivyVersion)
+        PIPELINE_WORKSPACE: $(Pipeline.Workspace)
+        CONTAINER_ARCHIVE: /artifacts/container-image/image.tar
+    - publish: reports/trivy
+      artifact: trivy-image-reports
+      condition: succeededOrFailed()
+- ${{ if eq(parameters.deployAzure, true) }}:
+  - stage: Infrastructure
+    displayName: 09 · Remote state, Terraform plan and apply
+    dependsOn:
+    - TrivyImage
+    jobs:
+    - job: Infrastructure
+      steps:
+      - bash: |-
+          set -euo pipefail
+          python scripts/pipeline_summary.py Infrastructure
+        displayName: Print stage purpose and release identity
+        env:
+          DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+      - template: pipelines/templates/install-terraform.yml
+      - task: AzureCLI@2
+        displayName: Apply saved plan with federated Azure identity
+        inputs:
+          azureSubscription: $(azureServiceConnection)
+          addSpnToEnvironment: true
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |-
+            set -euo pipefail
+            source scripts/terraform-auth.sh
+            trap 'bash scripts/agent-storage-access.sh "$STATE_STORAGE_ACCOUNT" "$STATE_RESOURCE_GROUP" remove || true' EXIT
+            source scripts/agent-storage-access.sh "$STATE_STORAGE_ACCOUNT" "$STATE_RESOURCE_GROUP" add tfstate
+            terraform -chdir=infra init -input=false -lockfile=readonly -backend-config="resource_group_name=$STATE_RESOURCE_GROUP" -backend-config="storage_account_name=$STATE_STORAGE_ACCOUNT" -backend-config="container_name=tfstate" -backend-config="key=volt-electronics/app.tfstate"
+            terraform -chdir=infra plan -input=false -lock-timeout=5m -out=deployment.tfplan
+            terraform -chdir=infra apply -input=false -lock-timeout=5m deployment.tfplan
+            mkdir -p "$(Build.ArtifactStagingDirectory)/deployment"
+            terraform -chdir=infra output -json > "$(Build.ArtifactStagingDirectory)/deployment/outputs.json"
+        env:
+          SUBSCRIPTION_ID: $(subscriptionId)
+          APP_NAME: $(appName)
+          AZURE_LOCATION: $(azureLocation)
+          STATE_RESOURCE_GROUP: $(stateResourceGroup)
+          STATE_STORAGE_ACCOUNT: $(stateStorageAccount)
+          SSH_PUBLIC_KEY: $(sshPublicKey)
+          TF_IN_AUTOMATION: 'true'
+      - publish: $(Build.ArtifactStagingDirectory)/deployment
+        artifact: deployment-outputs
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'), ne(variables['Build.Reason'], 'PullRequest'))
+  - stage: HubSonarQube
+    displayName: 10 · Persistent private hub analysis and quality gate
+    dependsOn:
+    - Infrastructure
+    jobs:
+    - job: HubSonarQube
+      steps:
+      - bash: |-
+          set -euo pipefail
+          python scripts/pipeline_summary.py HubSonarQube
+        displayName: Print stage purpose and release identity
+        env:
+          DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+      - download: current
+        artifact: deployment-outputs
+      - download: current
+        artifact: source-code
+      - download: current
+        artifact: unit-test-reports
+      - task: AzureCLI@2
+        displayName: Analyze verified release source on private hub VM
+        inputs:
+          azureSubscription: $(azureServiceConnection)
+          addSpnToEnvironment: true
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |
+            set -euo pipefail
+            outputs="$PIPELINE_WORKSPACE/deployment-outputs/outputs.json"
+            export RESOURCE_GROUP=$(jq -r .resource_group.value "$outputs")
+            export RELEASE_ACCOUNT=$(jq -r .release_storage_account.value "$outputs")
+            export RELEASE_PREFIX="builds/$BUILD_ID"
+            export VM_NAME=$(jq -r .sonar_vm_name.value "$outputs")
+            [[ -n "$VM_NAME" ]] || { echo 'The private SonarQube VM is required for this deployment'; exit 1; }
+            mkdir -p "$BUILD_ARTIFACTSTAGINGDIRECTORY/hub-sonarqube" "$AGENT_TEMPDIRECTORY/hub-inputs"
+            trap 'bash scripts/agent-storage-access.sh "$RELEASE_ACCOUNT" "$RESOURCE_GROUP" remove || true' EXIT
+            source scripts/agent-storage-access.sh "$RELEASE_ACCOUNT" "$RESOURCE_GROUP" add releases
+            cp "$PIPELINE_WORKSPACE/source-code/volt-electronics-source.zip" "$AGENT_TEMPDIRECTORY/hub-inputs/source.zip"
+            cp "$PIPELINE_WORKSPACE/unit-test-reports/coverage.xml" "$AGENT_TEMPDIRECTORY/hub-inputs/coverage.xml"
+            (cd "$AGENT_TEMPDIRECTORY/hub-inputs" && sha256sum source.zip coverage.xml > analysis-inputs.sha256)
+            for file in source.zip coverage.xml analysis-inputs.sha256; do
+              az storage blob upload --account-name "$RELEASE_ACCOUNT" --container-name releases --name "$RELEASE_PREFIX/$file" --file "$AGENT_TEMPDIRECTORY/hub-inputs/$file" --auth-mode login --overwrite false --output none
+            done
+            az storage blob upload --account-name "$RELEASE_ACCOUNT" --container-name releases --name "$RELEASE_PREFIX/sonarqube-compose.yml" --file ops/sonarqube-compose.yml --auth-mode login --overwrite false --output none
+            export SCRIPT_FILE=scripts/deploy-sonarqube.sh SUCCESS_MARKER=VOLT_SONAR_READY
+            bash scripts/run-vm-command.sh
+            export SCRIPT_FILE=scripts/scan-hub-sonarqube.sh SUCCESS_MARKER=VOLT_HUB_ANALYSIS_SUCCESS EXPECTED_COMMIT="$BUILD_SOURCEVERSION"
+            status=0
+            bash scripts/run-vm-command.sh || status=$?
+            for report in quality-gate issues measures; do
+              az storage blob download --account-name "$RELEASE_ACCOUNT" --container-name releases --name "$RELEASE_PREFIX/hub-sonarqube/$report.json" --file "$BUILD_ARTIFACTSTAGINGDIRECTORY/hub-sonarqube/$report.json" --auth-mode login --overwrite --output none || status=1
+            done
+            exit "$status"
+        env:
+          PIPELINE_WORKSPACE: $(Pipeline.Workspace)
+          BUILD_ID: $(Build.BuildId)
+      - publish: $(Build.ArtifactStagingDirectory)/hub-sonarqube
+        artifact: hub-sonarqube-reports
+        condition: succeededOrFailed()
+      timeoutInMinutes: 60
+  - stage: Release
+    displayName: 11 · Deploy exact scanned application image
+    dependsOn:
+    - HubSonarQube
+    jobs:
+    - job: Release
+      steps:
+      - bash: |-
+          set -euo pipefail
+          python scripts/pipeline_summary.py Release
+        displayName: Print stage purpose and release identity
+        env:
+          DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+      - download: current
+        artifact: deployment-outputs
+      - download: current
+        artifact: container-image
+      - task: AzureCLI@2
+        displayName: Upload immutable release and deploy using managed identity
+        inputs:
+          azureSubscription: $(azureServiceConnection)
+          addSpnToEnvironment: true
+          scriptType: bash
+          scriptLocation: inlineScript
+          inlineScript: |+
+            set -euo pipefail
+            outputs="$PIPELINE_WORKSPACE/deployment-outputs/outputs.json"
+
+            export RESOURCE_GROUP=$(jq -r .resource_group.value "$outputs")
+
+            export RELEASE_ACCOUNT=$(jq -r .release_storage_account.value "$outputs")
+
+            export RELEASE_PREFIX="builds/$BUILD_ID"
+
+            trap 'bash scripts/agent-storage-access.sh "$RELEASE_ACCOUNT" "$RESOURCE_GROUP" remove || true' EXIT
+
+            source scripts/agent-storage-access.sh "$RELEASE_ACCOUNT" "$RESOURCE_GROUP" add releases
+
+            cd "$PIPELINE_WORKSPACE/container-image"
+
+            sha256sum -c image.tar.sha256
+
+            cd "$BUILD_SOURCESDIRECTORY"
+
+            for file in image.tar image.tar.sha256; do
+
+              az storage blob upload --account-name "$RELEASE_ACCOUNT" --container-name releases --name "$RELEASE_PREFIX/$file" --file "$PIPELINE_WORKSPACE/container-image/$file" --auth-mode login --overwrite false --output none
+
+            done
+
+            export VM_NAME=$(jq -r .app_vm_name.value "$outputs") SCRIPT_FILE=scripts/deploy-vm.sh SUCCESS_MARKER=VOLT_DEPLOY_SUCCESS
+
+            bash scripts/run-vm-command.sh
+
+        env:
+          PIPELINE_WORKSPACE: $(Pipeline.Workspace)
+          BUILD_ID: $(Build.BuildId)
+      timeoutInMinutes: 60
+  - stage: Verify
+    displayName: 12 · Public endpoint and release smoke test
+    dependsOn:
+    - Release
+    jobs:
+    - job: Verify
+      steps:
+      - bash: |-
+          set -euo pipefail
+          python scripts/pipeline_summary.py Verify
+        displayName: Print stage purpose and release identity
+        env:
+          DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+      - task: UsePythonVersion@0
+        inputs:
+          versionSpec: $(pythonVersion)
+      - download: current
+        artifact: deployment-outputs
+      - bash: |-
+          set -euo pipefail
+          url=$(python -c "import json; print(json.load(open('$(Pipeline.Workspace)/deployment-outputs/outputs.json'))['url']['value'])")
+          python scripts/smoke.py "$url" --commit "$(Build.SourceVersion)"
+        displayName: Verify public health, catalog, assets and deployed commit
+- stage: Downloads
+  displayName: 13 · Download source and quality reports
+  dependsOn:
+  - Overview
+  - Validate
+  - UnitTests
+  - SonarQube
+  - TrivySource
+  - BuildPackage
+  - BuildContainer
+  - TrivyImage
+  jobs:
+  - job: Downloads
+    steps:
+    - bash: |-
+        set -euo pipefail
+        python scripts/pipeline_summary.py Downloads
+      displayName: Print stage purpose and release identity
+      env:
+        DEPLOY_REQUESTED: ${{ format('{0}', parameters.deployAzure) }}
+    - bash: |-
+        set -euo pipefail
+        mkdir -p "$(Build.ArtifactStagingDirectory)/download-guide"
+        python scripts/download_guide.py "$(Build.ArtifactStagingDirectory)/download-guide/README.md"
+        echo "##vso[task.uploadsummary]$(Build.ArtifactStagingDirectory)/download-guide/README.md"
+      displayName: Print artifact downloads and interpretation
+    - publish: $(Build.ArtifactStagingDirectory)/download-guide
+      artifact: download-guide
+      condition: succeededOrFailed()
+  condition: always()

@@ -1,0 +1,24 @@
+#cloud-config
+package_update: true
+packages:
+  - docker.io
+  - docker-compose-v2
+  - nginx
+  - unzip
+  - python3
+  - curl
+  - jq
+write_files:
+  - path: /etc/sysctl.d/99-sonarqube.conf
+    content: |
+      vm.max_map_count=524288
+  - path: /etc/docker/daemon.json
+    content: |
+      {"data-root":"/mnt/volt-data/docker","log-driver":"json-file","log-opts":{"max-size":"10m","max-file":"3"}}
+runcmd:
+  - systemctl stop docker
+  - sysctl --system
+  - curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+  - systemctl enable docker
+  - systemctl disable --now nginx
+final_message: "VOLT host packages installed; deployment mounts the managed data disk before starting containers."
